@@ -140,6 +140,8 @@ class DataStore < Hash
     }
   end
 
+  # TODO: Doesn't normalize data in the same vein as:
+  # https://github.com/rapid7/metasploit-framework/pull/6644
   def import_option(key, val, imported = true, imported_by = nil, option = nil)
     self.store(key, val)
 
@@ -166,6 +168,9 @@ class DataStore < Hash
     return str
   end
 
+  # Override Hash's to_h method so we can include the original case of each key
+  # (failing to do this breaks a number of places in framework and pro that use
+  # serialized datastores)
   def to_h
     datastore_hash = {}
     self.keys.each do |k|
