@@ -134,7 +134,7 @@ class MetasploitModule < Msf::Auxiliary
     end
   end
 
-  # This module sends this same request multiple times. In order to reduce code it has beed moved it into it's owm method
+  # This module sends this same request multiple times. In order to reduce code it has been moved it into it's owm method
   def send_injection_request_cgi(payload)
     res = send_request_cgi({
       'method' => 'POST',
@@ -176,7 +176,7 @@ class MetasploitModule < Msf::Auxiliary
         module_fullname: fullname,
         username: username,
         private_type: :nonreplayable_hash,
-        jtr_format: identify_hash(hash),
+        jtr_format: Metasploit::Framework::Hashes.identify_hash(hash),
         private_data: hash,
         service_name: 'SuiteCRM',
         address: datastore['RHOSTS'],

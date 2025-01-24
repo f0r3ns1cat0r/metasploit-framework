@@ -6,6 +6,8 @@
 class MetasploitModule < Msf::Auxiliary
 
   include Msf::Exploit::Remote::LDAP
+  include Msf::Exploit::Remote::LDAP::Queries
+  include Msf::OptionalSession::LDAP
   require 'json'
   require 'yaml'
 
@@ -25,7 +27,7 @@ class MetasploitModule < Msf::Auxiliary
 
           Users can also run a single query by using the RUN_SINGLE_QUERY option and then setting
           the QUERY_FILTER datastore option to the filter to send to the LDAP server and QUERY_ATTRIBUTES
-          to a comma seperated string containing the list of attributes they are interested in obtaining
+          to a comma separated string containing the list of attributes they are interested in obtaining
           from the results.
 
           As a third option can run one of several predefined queries by setting ACTION to the
@@ -62,7 +64,7 @@ class MetasploitModule < Msf::Auxiliary
       OptString.new('BASE_DN', [false, 'LDAP base DN if you already have it']),
       OptPath.new('QUERY_FILE_PATH', [false, 'Path to the JSON or YAML file to load and run queries from'], conditions: %w[ACTION == RUN_QUERY_FILE]),
       OptString.new('QUERY_FILTER', [false, 'Filter to send to the target LDAP server to perform the query'], conditions: %w[ACTION == RUN_SINGLE_QUERY]),
-      OptString.new('QUERY_ATTRIBUTES', [false, 'Comma seperated list of attributes to retrieve from the server'], conditions: %w[ACTION == RUN_SINGLE_QUERY])
+      OptString.new('QUERY_ATTRIBUTES', [false, 'Comma separated list of attributes to retrieve from the server'], conditions: %w[ACTION == RUN_SINGLE_QUERY])
     ])
   end
 
@@ -123,228 +125,85 @@ class MetasploitModule < Msf::Auxiliary
     [actions, default_action]
   end
 
-  def safe_load_queries(filename)
-    begin
-      settings = YAML.safe_load(File.binread(filename))
-    rescue StandardError => e
-      elog("Couldn't parse #{filename}", error: e)
-      return
-    end
-
-    return unless settings['queries'].is_a? Array
-
-    settings['queries']
-  end
-
-  def perform_ldap_query(ldap, filter, attributes, base: nil)
-    base ||= @base_dn
-    returned_entries = ldap.search(base: base, filter: filter, attributes: attributes)
-    query_result = ldap.as_json['result']['ldap_result']
-    case query_result['resultCode']
-    when 0
-      vprint_good('Successfully queried LDAP server!')
-    when 1
-      print_error("Could not perform query #{filter}. Its likely the query requires authentication!")
-      fail_with(Failure::NoAccess, query_result['errorMessage'])
-    else
-      fail_with(Failure::UnexpectedReply, "Query #{filter} failed with error: #{query_result['errorMessage']}")
-    end
-    if returned_entries.nil? || returned_entries.empty?
-      print_error("No results found for #{filter}.")
-      nil
-    else
-      returned_entries
-    end
-  end
-
-  def generate_rex_tables(entries, format)
-    entries.each do |entry|
-      tbl = Rex::Text::Table.new(
-        'Header' => entry[:dn][0].split(',').join(' '),
-        'Indent' => 1,
-        'Columns' => %w[Name Attributes]
-      )
-
-      entry.each_key do |attr|
-        if format == 'table'
-          tbl << [attr, entry[attr].join(' || ')] unless attr == :dn # Skip over DN entries for tables since DN information is shown in header.
-        else
-          tbl << [attr, entry[attr].join(' || ')] # DN information is not shown in CSV output as a header so keep DN entries in.
-        end
-      end
-
-      case format
-      when 'table'
-        print_line(tbl.to_s)
-      when 'csv'
-        print_line(tbl.to_csv)
-      else
-        fail_with(Failure::BadConfig, "Invalid format #{format} passed to generate_rex_tables!")
-      end
-    end
-  end
-
-  def output_json_data(entries)
-    entries.each do |entry|
-      result = ''
-      data = {}
-      entry.each_key do |attr|
-        data[attr] = entry[attr].join(' || ')
-      end
-      result << JSON.pretty_generate(data) + ",\n"
-      result.gsub!(/},\n$/, '}')
-      print_status(entry[:dn][0].split(',').join(' '))
-      print_line(result)
-    end
-  end
-
-  def output_data_table(entries)
-    generate_rex_tables(entries, 'table')
-  end
-
-  def output_data_csv(entries)
-    generate_rex_tables(entries, 'csv')
-  end
-
-  def normalize_entries(entries)
-    cleaned_entries = []
-    entries.each do |entry|
-      # Convert to a hash so we get only the data we need.
-      entry = entry.to_h
-      entry_keys = entry.keys
-      entry_keys.each do |key|
-        entry[key] = entry[key].map { |v| Rex::Text.to_hex_ascii(v) }
-      end
-      cleaned_entries.append(entry)
-    end
-    cleaned_entries
-  end
-
-  def show_output(entries)
-    case datastore['OUTPUT_FORMAT']
-    when 'csv'
-      output_data_csv(entries)
-    when 'table'
-      output_data_table(entries)
-    when 'json'
-      output_json_data(entries)
-    else
-      fail_with(Failure::BadConfig, 'Supported OUTPUT_FORMAT values are csv, table and json')
-    end
-  end
-
-  def run_queries_from_file(ldap, queries)
-    queries.each do |query|
-      unless query['action'] && query['filter'] && query['attributes']
-        fail_with(Failure::BadConfig, "Each query in the query file must at least contain a 'action', 'filter' and 'attributes' attribute!")
-      end
-      attributes = query['attributes']
-      if attributes.nil? || attributes.empty?
-        print_warning('At least one attribute needs to be specified per query in the query file for entries to work!')
-        break
-      end
-      filter = Net::LDAP::Filter.construct(query['filter'])
-      print_status("Running #{query['action']}...")
-      entries = perform_ldap_query(ldap, filter, attributes, base: (query['base_dn_prefix'] ? [query['base_dn_prefix'], @base_dn].join(',') : nil))
-
-      if entries.nil?
-        print_warning("Query #{query['filter']} from #{query['action']} didn't return any results!")
-        next
-      end
-
-      entries = normalize_entries(entries)
-      show_output(entries)
-    end
-  end
-
   def run
-    entries = nil
-    begin
-      ldap_connect do |ldap|
-        bind_result = ldap.as_json['result']['ldap_result']
+    ldap_connect do |ldap|
+      validate_bind_success!(ldap)
 
-        # Codes taken from https://ldap.com/ldap-result-code-reference-core-ldapv3-result-codes
-        case bind_result['resultCode']
-        when 0
-          print_good('Successfully bound to the LDAP server!')
-        when 1
-          fail_with(Failure::NoAccess, "An operational error occurred, perhaps due to lack of authorization. The error was: #{bind_result['errorMessage']}")
-        when 7
-          fail_with(Failure::NoTarget, 'Target does not support the simple authentication mechanism!')
-        when 8
-          fail_with(Failure::NoTarget, "Server requires a stronger form of authentication than we can provide! The error was: #{bind_result['errorMessage']}")
-        when 14
-          fail_with(Failure::NoTarget, "Server requires additional information to complete the bind. Error was: #{bind_result['errorMessage']}")
-        when 48
-          fail_with(Failure::NoAccess, "Target doesn't support the requested authentication type we sent. Try binding to the same user without a password, or providing credentials if you were doing anonymous authentication.")
-        when 49
-          fail_with(Failure::NoAccess, 'Invalid credentials provided!')
-        else
-          fail_with(Failure::Unknown, "Unknown error occurred whilst binding: #{bind_result['errorMessage']}")
-        end
-        if (@base_dn = datastore['BASE_DN'])
-          print_status("User-specified base DN: #{@base_dn}")
-        else
-          print_status('Discovering base DN automatically')
-
-          unless (@base_dn = discover_base_dn(ldap))
-            print_warning("Couldn't discover base DN!")
-          end
-        end
-
-        case action.name
-        when 'RUN_QUERY_FILE'
-          unless datastore['QUERY_FILE_PATH']
-            fail_with(Failure::BadConfig, 'When using the RUN_QUERY_FILE action, one must specify the path to the JASON/YAML file containing the queries via QUERY_FILE_PATH!')
-          end
-          print_status("Loading queries from #{datastore['QUERY_FILE_PATH']}...")
-
-          parsed_queries = safe_load_queries(datastore['QUERY_FILE_PATH']) || []
-          if parsed_queries.empty?
-            fail_with(Failure::BadConfig, "No queries loaded from #{datastore['QUERY_FILE_PATH']}!")
-          end
-
-          run_queries_from_file(ldap, parsed_queries)
-          return
-        when 'RUN_SINGLE_QUERY'
-          unless datastore['QUERY_FILTER'] && datastore['QUERY_ATTRIBUTES']
-            fail_with(Failure::BadConfig, 'When using the RUN_SINGLE_QUERY action, one must supply the QUERY_FILTER and QUERY_ATTRIBUTE datastore options!')
-          end
-
-          begin
-            filter = Net::LDAP::Filter.construct(datastore['QUERY_FILTER'])
-          rescue StandardError => e
-            fail_with(Failure::BadConfig, "Could not compile the filter #{datastore['QUERY_FILTER']}. Error was #{e}")
-          end
-
-          print_status("Sending single query #{datastore['QUERY_FILTER']} to the LDAP server...")
-          attributes = datastore['QUERY_ATTRIBUTES'].split(',')
-          if attributes.empty?
-            fail_with(Failure::BadConfig, 'Attributes list is empty as we could not find at least one attribute to filter on!')
-          end
-          entries = perform_ldap_query(ldap, filter, attributes)
-          print_error("No entries could be found for #{datastore['QUERY_FILTER']}!") if entries.nil? || entries.empty?
-        else
-          query = @loaded_queries[datastore['ACTION']].nil? ? @loaded_queries[default_action] : @loaded_queries[datastore['ACTION']]
-          fail_with(Failure::BadConfig, "Invalid action: #{datastore['ACTION']}") unless query
-
-          begin
-            filter = Net::LDAP::Filter.construct(query['filter'])
-          rescue StandardError => e
-            fail_with(Failure::BadConfig, "Could not compile the filter #{query['filter']}. Error was #{e}")
-          end
-
-          entries = perform_ldap_query(ldap, filter, query['attributes'], base: (query['base_dn_prefix'] ? [query['base_dn_prefix'], @base_dn].join(',') : nil))
-        end
+      if datastore['BASE_DN'].blank?
+        fail_with(Failure::UnexpectedReply, "Couldn't discover base DN!") unless ldap.base_dn
+        base_dn = ldap.base_dn
+        print_status("#{ldap.peerinfo} Discovered base DN: #{base_dn}")
+      else
+        base_dn = datastore['BASE_DN']
       end
-    rescue Rex::ConnectionTimeout
-      fail_with(Failure::Unreachable, "Couldn't reach #{datastore['RHOST']}!")
-    rescue Net::LDAP::Error => e
-      fail_with(Failure::UnexpectedReply, "Could not query #{datastore['RHOST']}! Error was: #{e.message}")
-    end
-    return if entries.nil? || entries.empty?
 
-    entries = normalize_entries(entries)
-    show_output(entries)
+      schema_dn = ldap.schema_dn
+      case action.name
+      when 'RUN_QUERY_FILE'
+        unless datastore['QUERY_FILE_PATH']
+          fail_with(Failure::BadConfig, 'When using the RUN_QUERY_FILE action, one must specify the path to the JSON/YAML file containing the queries via QUERY_FILE_PATH!')
+        end
+        print_status("Loading queries from #{datastore['QUERY_FILE_PATH']}...")
+
+        parsed_queries = safe_load_queries(datastore['QUERY_FILE_PATH']) || []
+        if parsed_queries.empty?
+          fail_with(Failure::BadConfig, "No queries loaded from #{datastore['QUERY_FILE_PATH']}!")
+        end
+
+        run_queries_from_file(ldap, parsed_queries, schema_dn, datastore['OUTPUT_FORMAT'])
+        return
+      when 'RUN_SINGLE_QUERY'
+        unless datastore['QUERY_FILTER']
+          fail_with(Failure::BadConfig, 'When using the RUN_SINGLE_QUERY action, one must supply the QUERY_FILTER datastore option!')
+        end
+
+        print_status("Sending single query #{datastore['QUERY_FILTER']} to the LDAP server...")
+        if datastore['QUERY_ATTRIBUTES'].present?
+          # Split attributes string into an array of attributes, splitting on the comma character.
+          # Also downcase for consistency with rest of the code since LDAP searches aren't case sensitive.
+          attributes = datastore['QUERY_ATTRIBUTES'].downcase.split(',')
+
+          # Strip out leading and trailing whitespace from the attributes before using them.
+          attributes.map(&:strip!)
+        else
+          attributes = nil
+        end
+        filter_string = datastore['QUERY_FILTER']
+        query_base = base_dn
+      else
+        query = @loaded_queries[datastore['ACTION']].nil? ? @loaded_queries[default_action] : @loaded_queries[datastore['ACTION']]
+        fail_with(Failure::BadConfig, "Invalid action: #{datastore['ACTION']}") unless query
+
+        filter_string = query['filter']
+        attributes = query['attributes']
+        query_base = (query['base_dn_prefix'] ? [query['base_dn_prefix'], base_dn].join(',') : base_dn)
+      end
+
+      begin
+        filter = Net::LDAP::Filter.construct(filter_string)
+      rescue StandardError => e
+        fail_with(Failure::BadConfig, "Could not compile the filter #{filter_string}. Error was #{e}")
+      end
+
+      result_count = perform_ldap_query_streaming(ldap, filter, attributes, query_base, schema_dn) do |result, attribute_properties|
+        show_output(normalize_entry(result, attribute_properties), datastore['OUTPUT_FORMAT'])
+      end
+
+      if result_count == 0
+        print_error("No entries could be found for #{filter_string}!")
+      else
+        print_status("Query returned #{result_count} result#{result_count == 1 ? '' : 's'}.")
+      end
+    end
+  rescue Errno::ECONNRESET
+    fail_with(Failure::Disconnected, 'The connection was reset.')
+  rescue Rex::ConnectionError => e
+    fail_with(Failure::Unreachable, e.message)
+  rescue Rex::Proto::Kerberos::Model::Error::KerberosError => e
+    fail_with(Failure::NoAccess, e.message)
+  rescue Net::LDAP::Error => e
+    fail_with(Failure::Unknown, "#{e.class}: #{e.message}")
   end
+
+  attr_reader :loaded_queries # Queries loaded from the yaml config file
 end

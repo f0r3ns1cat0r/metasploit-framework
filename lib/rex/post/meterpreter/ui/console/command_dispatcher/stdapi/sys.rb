@@ -660,7 +660,7 @@ class Console::CommandDispatcher::Stdapi::Sys
 
   #
   # validates an array of pids against the running processes on target host
-  # behavior can be controlled to allow/deny proces 0 and the session's process
+  # behavior can be controlled to allow/deny process 0 and the session's process
   # the pids:
   # - are converted to integers
   # - have had pid 0 removed unless allow_pid_0
@@ -686,7 +686,7 @@ class Console::CommandDispatcher::Stdapi::Sys
     # get the current session pid so we don't suspend it later
     mypid = client.sys.process.getpid.to_i
 
-    # remove nils & redundant pids, conver to int
+    # remove nils & redundant pids, convert to int
     clean_pids = pids.compact.uniq.map{|x| x.to_i}
     # now we look up the pids & remove bad stuff if nec
     clean_pids.delete_if do |p|
@@ -1019,7 +1019,18 @@ class Console::CommandDispatcher::Stdapi::Sys
               print_error('Invalid characters provided! Could not fully convert data provided to -d argument!')
               return false
             end
-           data = data.pack("C*")
+            data = data.pack("C*")
+          elsif type == 'REG_DWORD' || type == 'REG_QWORD'
+            if data =~ /^\d+$/
+              data = data.to_i
+            elsif data =~ /^0x[a-fA-F0-9]+$/
+              data = data[2..].to_i(16)
+            else
+              print_error("Invalid data provided, #{type} must be numeric.")
+              return false
+            end
+          elsif type == 'REG_MULTI_SZ'
+            data = data.split('\0')
           end
 
           open_key.set_value(value, client.sys.registry.type2str(type), data)
@@ -1066,6 +1077,8 @@ class Console::CommandDispatcher::Stdapi::Sys
           data = v.data
           if v.type == REG_BINARY
             data = data.unpack('H*')[0]
+          elsif v.type == REG_MULTI_SZ
+            data = data.join('\0')
           end
 
           print(
